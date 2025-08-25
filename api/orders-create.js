@@ -1,6 +1,7 @@
-// Serverless function for Vercel (Node 18, ESM)
+// Serverless function for Vercel (Node 18/20/22)
 // Endpoint: POST /api/orders-create
-// Copies Zapiet fields from originating draft to the order's note_attributes.
+// Copies Zapiet fields from originating draft to the order's note_attributes,
+// but only if the order is tagged "samita-wholesale".
 
 import crypto from "node:crypto";
 
@@ -39,15 +40,14 @@ function differs(a1, a2) {
 }
 
 async function shopifyGET(env, path) {
-  const res = await fetch(`https://${env.SHOP_DOMAIN}${path}`, {
+  return fetch(`https://${env.SHOP_DOMAIN}${path}`, {
     method: "GET",
     headers: { "X-Shopify-Access-Token": env.ADMIN_API_TOKEN }
   });
-  return res;
 }
 
 async function shopifyPUT(env, path, body) {
-  const res = await fetch(`https://${env.SHOP_DOMAIN}${path}`, {
+  return fetch(`https://${env.SHOP_DOMAIN}${path}`, {
     method: "PUT",
     headers: {
       "X-Shopify-Access-Token": env.ADMIN_API_TOKEN,
@@ -55,7 +55,6 @@ async function shopifyPUT(env, path, body) {
     },
     body: JSON.stringify(body)
   });
-  return res;
 }
 
 // ---- Handler ----
@@ -64,74 +63,105 @@ export default async function handler(req, res) {
     return res.status(200).send("OK");
   }
 
-  // 1) Verify HMAC
   const raw = await readRawBody(req);
-  const secret = process.env.WEBHOOK_SECRET; // from your custom app: "Webhook signing secret"
+
+  // 1) Verify HMAC
+  const secret = process.env.WEBHOOK_SECRET;
   const hmacHeader = req.headers["x-shopify-hmac-sha256"];
   if (!secret || !hmacHeader) {
+    console.log("[Webhook] Missing secret or HMAC header");
     return res.status(401).send("Missing secret or hmac");
   }
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(raw)
-    .digest("base64");
+  const digest = crypto.createHmac("sha256", secret).update(raw).digest("base64");
   if (!timingSafeEqual(digest, hmacHeader)) {
+    console.log("[Webhook] Bad HMAC");
     return res.status(401).send("Bad HMAC");
   }
 
-  // 2) Parse webhook
+  // 2) Parse webhook body
   let order;
-  try { order = JSON.parse(raw.toString("utf8")); }
-  catch { return res.status(400).send("Bad JSON"); }
-
-  const orderId = order?.id;
-  if (!orderId) {
-    // Always 200 so Shopify doesn’t retry forever
-    return res.status(200).send("No order id");
+  try {
+    order = JSON.parse(raw.toString("utf8"));
+  } catch (e) {
+    console.log("[Webhook] Bad JSON parse", e);
+    return res.status(400).send("Bad JSON");
   }
 
-  // 3) GET order (to read draft_order_id + existing note_attributes)
+  const orderId = order?.id;
+  console.log("[Webhook] Received order id:", orderId);
+  if (!orderId) return res.status(200).send("No order id");
+
+  // 3) GET order (for tags + draft_order_id + existing note_attributes)
   const oResp = await shopifyGET(process.env, `/admin/api/2025-01/orders/${orderId}.json`);
-  if (!oResp.ok) return res.status(200).send("GET order failed");
+  if (!oResp.ok) {
+    console.log("[Webhook] GET order failed", oResp.status);
+    return res.status(200).send("GET order failed");
+  }
   const fullOrder = await oResp.json();
+
+  const tags = (fullOrder?.order?.tags || "").toLowerCase();
+  console.log("[Webhook] Order tags:", tags);
+
+  if (!tags.includes("samita-wholesale")) {
+    console.log("[Webhook] Not a Samita order, skipping");
+    return res.status(200).send("Not a Samita order");
+  }
+
   const draftId = fullOrder?.order?.draft_order_id;
+  console.log("[Webhook] Draft id:", draftId);
+
   if (!draftId) {
-    // If Samita sometimes creates orders without a draft link, nothing to do
+    console.log("[Webhook] No draft link on order");
     return res.status(200).send("No draft link");
   }
 
-  // 4) GET draft (to read Zapiet attrs)
+  // 4) GET draft
   const dResp = await shopifyGET(process.env, `/admin/api/2025-01/draft_orders/${draftId}.json`);
-  if (!dResp.ok) return res.status(200).send("GET draft failed");
+  if (!dResp.ok) {
+    console.log("[Webhook] GET draft failed", dResp.status);
+    return res.status(200).send("GET draft failed");
+  }
   const draft = await dResp.json();
 
   const wanted = new Set(["Delivery-Location-Id","Delivery-Date","Checkout-Method"]);
   const draftAttrs = (draft?.draft_order?.note_attributes || []).filter(a => wanted.has(a?.name));
+
+  console.log("[Webhook] Draft note_attributes:", draftAttrs);
+
   if (!draftAttrs.length) {
+    console.log("[Webhook] No Zapiet attrs found on draft");
     return res.status(200).send("No Zapiet attrs on draft");
   }
 
-  // 5) Merge + update order note_attributes
+  // 5) Merge with existing
   const existing = fullOrder?.order?.note_attributes || [];
   const merged = mergeNoteAttributes(existing, draftAttrs);
+  console.log("[Webhook] Existing attrs:", existing);
+  console.log("[Webhook] Merged attrs:", merged);
+
   if (!differs(existing, merged)) {
+    console.log("[Webhook] No changes needed");
     return res.status(200).send("No changes needed");
   }
 
+  // 6) PUT order to update
   const putResp = await shopifyPUT(
     process.env,
     `/admin/api/2025-01/orders/${orderId}.json`,
     { order: { id: orderId, note_attributes: merged } }
   );
-  // Always 200 to acknowledge webhook; log failures in Vercel logs if any
+
   if (!putResp.ok) {
     const txt = await putResp.text().catch(() => "");
-    console.log("PUT order failed", putResp.status, txt);
+    console.log("[Webhook] PUT order failed", putResp.status, txt);
+  } else {
+    console.log("[Webhook] Order updated successfully");
   }
+
   return res.status(200).send("Done");
 }
 
-// Disable Vercel's default body parsing so we can verify HMAC on the raw body
+// Disable Vercel body parsing so we can verify raw HMAC
 export const config = {
   api: { bodyParser: false }
 };
