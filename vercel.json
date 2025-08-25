@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "api/orders-create.js": {
+      "runtime": "nodejs18.x",
+      "memory": 128,
+      "maxDuration": 10
+    }
+  }
+}
